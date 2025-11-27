@@ -315,6 +315,8 @@ def train(config: TrainingConfig):
     tokenizer = AutoTokenizer.from_pretrained(config.tokenizer_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    # Set tokenizer max length to match our config to suppress warnings
+    tokenizer.model_max_length = config.max_seq_len
     
     vocab_size = len(tokenizer)
     
@@ -534,33 +536,39 @@ def train(config: TrainingConfig):
             print("\nTraining interrupted by user.")
     
     finally:
-        if is_main_process:
-            pbar.close()
-            
-            # Finish any remaining accumulation
-            if accumulation_counter % config.gradient_accumulation_steps != 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad()
-                global_step += 1
-            
-            # Save final checkpoint (atomic save with interrupt protection)
-            avg_loss = running_loss / loss_count if loss_count > 0 else 0.0
-            print(f"\nSaving final checkpoint at step {global_step}...")
-            checkpoint_manager.save_checkpoint(
-                model=model,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                epoch=epoch,
-                step=global_step,
-                loss=avg_loss,
-                config=config,
-                is_best=False
-            )
-            print(f"Checkpoint saved successfully.")
-        
-        cleanup_distributed()
+        try:
+            if is_main_process:
+                pbar.close()
+                
+                # Finish any remaining accumulation
+                if accumulation_counter % config.gradient_accumulation_steps != 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad()
+                    global_step += 1
+                
+                # Save final checkpoint (atomic save with interrupt protection)
+                avg_loss = running_loss / loss_count if loss_count > 0 else 0.0
+                print(f"\nSaving final checkpoint at step {global_step}...")
+                checkpoint_manager.save_checkpoint(
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    epoch=epoch,
+                    step=global_step,
+                    loss=avg_loss,
+                    config=config,
+                    is_best=False
+                )
+                print(f"Checkpoint saved successfully.")
+        except KeyboardInterrupt:
+            # Second interrupt during final save - checkpoint still completed due to defer_interrupts
+            if is_main_process:
+                print("\nSecond interrupt received. Checkpoint was saved. Cleaning up...")
+        finally:
+            # Always cleanup distributed, even if interrupted during final save
+            cleanup_distributed()
 
 
 def main():

@@ -24,7 +24,7 @@ activation_checkpointing: true  # Set true to enable activation checkpointing (r
 # - Use limit parameter in data_loader to restrict to 7.7B tokens
 data_path: "hf://datasets/HuggingFaceFW/fineweb/sample/100BT"
 total_tokens: 7700000000  # 7.7 billion tokens
-num_workers: 4  # Number of data loading workers
+num_workers: 0  # Must be 0 for IterableDataset (streaming) to avoid duplicate data reads
 
 # Tokenizer
 tokenizer_name: "gpt2"
