@@ -141,7 +141,8 @@ class StreamingFineWebDataset(IterableDataset):
         Each sequence is densely packed with document tokens.
         """
         # Create fresh reader and buffer for each iteration
-        data_reader = ParquetReader(self.data_path, limit=self.limit)
+        # ParquetReader expects -1 for no limit, not None
+        data_reader = ParquetReader(self.data_path, limit=self.limit if self.limit is not None else -1)
         buffer = PackedTokenBuffer(self.tokenizer, self.max_length)
         
         # Process documents
@@ -296,7 +297,8 @@ class TokenLimitedDataset(IterableDataset):
     
     def __iter__(self) -> Iterator[dict]:
         """Iterate until target token count is reached."""
-        data_reader = ParquetReader(self.data_path, limit=self.document_limit)
+        # ParquetReader expects -1 for no limit, not None
+        data_reader = ParquetReader(self.data_path, limit=self.document_limit if self.document_limit is not None else -1)
         buffer = PackedTokenBuffer(self.tokenizer, self.max_length)
         
         tokens_yielded = 0
@@ -396,7 +398,8 @@ def create_dataloader(
         dataset = StreamingFineWebDataset(data_path, tokenizer, max_length, limit)
         print(f"Created StreamingFineWebDataset with efficient token packing")
     else:
-        data_reader = ParquetReader(data_path, limit=limit)
+        # ParquetReader expects -1 for no limit, not None
+        data_reader = ParquetReader(data_path, limit=limit if limit is not None else -1)
         dataset = FineWebDataset(data_reader, tokenizer, max_length)
     
     # For IterableDataset, num_workers > 0 can cause issues
