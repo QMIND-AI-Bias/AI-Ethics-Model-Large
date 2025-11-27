@@ -73,7 +73,11 @@ torchrun --nproc_per_node=4 train.py --config config.yaml
 
 ### Resume from checkpoint:
 ```bash
+# Single GPU resume
 python train.py --config config.yaml --resume
+
+# Multi-GPU resume
+torchrun --nproc_per_node=<num_gpus> train.py --config config.yaml --resume
 ```
 
 ## 6. Monitor Training

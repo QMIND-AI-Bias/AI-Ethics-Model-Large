@@ -43,6 +43,18 @@ def cleanup_distributed():
         dist.destroy_process_group()
 
 
+def broadcast_from_main(obj, src: int = 0):
+    """
+    Broadcast a picklable Python object from the main process to all other ranks.
+    Returns the broadcast object on every rank (or the original object if not distributed).
+    """
+    if dist.is_available() and dist.is_initialized():
+        object_list = [obj]
+        dist.broadcast_object_list(object_list, src=src)
+        return object_list[0]
+    return obj
+
+
 class CheckpointManager:
     """Manages saving and loading checkpoints"""
     def __init__(self, checkpoint_dir: str):
@@ -302,15 +314,25 @@ def train(config: TrainingConfig):
     start_step = 0
     best_loss = float('inf')
     
-    checkpoint_info = checkpoint_manager.get_latest_checkpoint_info()
-    if checkpoint_info and config.resume:
-        if is_main_process:
-            print(f"\nResuming from checkpoint at step {checkpoint_info['latest_step']}")
-        checkpoint = checkpoint_manager.load_checkpoint(model, optimizer, scheduler)
-        if checkpoint:
-            start_epoch = checkpoint['epoch']
-            start_step = checkpoint['step']
-            best_loss = checkpoint.get('loss', float('inf'))
+    checkpoint_info = None
+    if config.resume:
+        metadata = checkpoint_manager.get_latest_checkpoint_info() if is_main_process else None
+        checkpoint_info = broadcast_from_main(metadata, src=0) if world_size > 1 else metadata
+        if checkpoint_info:
+            if is_main_process:
+                print(f"\nResuming from checkpoint at step {checkpoint_info['latest_step']}")
+            checkpoint = checkpoint_manager.load_checkpoint(model, optimizer, scheduler)
+            if checkpoint:
+                start_epoch = checkpoint['epoch']
+                start_step = checkpoint['step']
+                best_loss = checkpoint.get('loss', float('inf'))
+            else:
+                raise RuntimeError("Failed to load checkpoint despite metadata indicating availability.")
+        elif is_main_process:
+            print("\n--resume flag provided but no checkpoint metadata found. Starting from scratch.")
+        if world_size > 1:
+            # Make sure every rank finishes loading before training resumes
+            dist.barrier()
     
     # Training loop
     model.train()
