@@ -1,4 +1,6 @@
 # Core dependencies
+# For NVIDIA Blackwell / RTX 6000 PRO GPUs, install the CUDA 12.4+ nightly wheels
+# listed in docs/BLACKWELL.md instead of relying on the default torch resolver.
 torch>=2.0.0
 transformers>=4.30.0
 datatrove>=0.6.0

@@ -33,6 +33,12 @@ pip install flash-attn --no-build-isolation
 - Build dependencies (psutil, ninja, packaging) are included in requirements.txt and will be installed automatically
 - If you get build errors, make sure torch is installed with CUDA support and all build dependencies are available
 
+### NVIDIA Blackwell / RTX 6000 PRO GPUs
+
+- Install the latest PyTorch nightly wheel with CUDA 12.4+ so that `sm_120` kernels are included.
+- Rebuild FlashAttention with `TORCH_CUDA_ARCH_LIST="sm90;sm120"` (the install script auto-detects this).
+- Detailed, copy/pasteable commands are documented in `docs/BLACKWELL.md`.
+
 ## Configuration
 
 Edit `config.yaml` to adjust training parameters:

@@ -40,6 +40,29 @@ def check_cuda():
             print(f"✓ CUDA is available")
             print(f"  Device: {torch.cuda.get_device_name(0)}")
             print(f"  CUDA Version: {torch.version.cuda}")
+            capability = torch.cuda.get_device_capability(0)
+            arch_tag = f"sm_{capability[0]}{capability[1]}"
+            print(f"  Compute capability: {arch_tag}")
+            
+            get_arch_list = getattr(torch.cuda, "get_arch_list", None)
+            compiled_arches = get_arch_list() if callable(get_arch_list) else []
+            if compiled_arches:
+                print(f"  PyTorch built for: {', '.join(compiled_arches)}")
+                if arch_tag not in compiled_arches:
+                    print(f"✗ Current PyTorch build does not include kernels for {arch_tag}.")
+                    print("  Install a CUDA 12.4+ nightly build as described in docs/BLACKWELL.md.")
+                    return False
+            
+            cuda_version = torch.version.cuda
+            if capability[0] >= 12:
+                try:
+                    cuda_float = float(cuda_version)
+                except (TypeError, ValueError):
+                    cuda_float = None
+                if cuda_float is not None and cuda_float < 12.4:
+                    print("✗ CUDA runtime too old for Blackwell GPUs. Need CUDA 12.4+ build of PyTorch.")
+                    print("  Follow docs/BLACKWELL.md to reinstall torch/flash-attn.")
+                    return False
             return True
         else:
             print("✗ CUDA is NOT available (CPU only)")

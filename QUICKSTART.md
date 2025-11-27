@@ -25,6 +25,12 @@ pip install flash-attn --no-build-isolation
   - All build dependencies are installed (psutil, ninja, packaging)
 - For memory-constrained GPUs, enable activation checkpointing in `config.yaml` (`activation_checkpointing: true`) and use gradient accumulation (`gradient_accumulation_steps`)
 
+### Running on Blackwell / RTX 6000 PRO GPUs
+
+- Install the PyTorch nightly wheel with CUDA 12.4+ (see `docs/BLACKWELL.md`).
+- Reinstall FlashAttention with `TORCH_CUDA_ARCH_LIST="sm90;sm120"` so kernels are compiled for compute capability 12.0.
+- The helper script `install_flash_attn.sh` now auto-detects Blackwell GPUs and sets these flags for you.
+
 ## 2. Verify Setup
 
 ```bash

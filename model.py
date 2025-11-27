@@ -8,12 +8,23 @@ Decoder-only Transformer model with modern architecture components:
 """
 
 import math
+import warnings
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple
-from flash_attn import flash_attn_func
 from torch.utils.checkpoint import checkpoint as activation_checkpoint
+
+try:
+    from flash_attn import flash_attn_func
+    _FLASH_ATTN_AVAILABLE = True
+    _FLASH_ATTN_IMPORT_ERROR = None
+except Exception as exc:  # pragma: no cover - only hit when flash-attn missing
+    flash_attn_func = None
+    _FLASH_ATTN_AVAILABLE = False
+    _FLASH_ATTN_IMPORT_ERROR = exc
+
+_FLASH_ATTENTION_FALLBACK_WARNED = False
 
 
 class RMSNorm(nn.Module):
@@ -128,18 +139,53 @@ class MultiHeadAttention(nn.Module):
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
         
-        # FlashAttention-2
-        # FlashAttention expects causal mask by default, but we can pass custom mask
-        attn_output = flash_attn_func(
-            q, k, v,
-            dropout_p=self.dropout if self.training else 0.0,
-            softmax_scale=1.0 / math.sqrt(self.head_dim),
-            causal=True
-        )  # [batch, num_heads, seq_len, head_dim]
+        use_flash = (
+            _FLASH_ATTN_AVAILABLE
+            and x.is_cuda
+            and q.dtype in (torch.float16, torch.bfloat16)
+        )
         
-        # Reshape back: [batch, num_heads, seq_len, head_dim] -> [batch, seq_len, num_heads, head_dim]
-        attn_output = attn_output.transpose(1, 2)
-        attn_output = attn_output.contiguous().view(batch_size, seq_len, self.dim)
+        if use_flash:
+            # FlashAttention expects causal mask by default, but we can pass custom mask
+            attn_output = flash_attn_func(
+                q, k, v,
+                dropout_p=self.dropout if self.training else 0.0,
+                softmax_scale=1.0 / math.sqrt(self.head_dim),
+                causal=True
+            )  # [batch, num_heads, seq_len, head_dim]
+            
+            # Reshape back: [batch, num_heads, seq_len, head_dim] -> [batch, seq_len, num_heads, head_dim]
+            attn_output = attn_output.transpose(1, 2)
+            attn_output = attn_output.contiguous().view(batch_size, seq_len, self.dim)
+        else:
+            global _FLASH_ATTENTION_FALLBACK_WARNED
+            if not _FLASH_ATTENTION_FALLBACK_WARNED:
+                reason = (
+                    f"import error: {_FLASH_ATTN_IMPORT_ERROR}"
+                    if not _FLASH_ATTN_AVAILABLE
+                    else "inputs not CUDA or dtype unsupported; using PyTorch SDPA"
+                )
+                warnings.warn(
+                    f"FlashAttention-2 is unavailable ({reason}). "
+                    "Falling back to torch.nn.functional.scaled_dot_product_attention. "
+                    "Training will be slower on long contexts.",
+                    RuntimeWarning,
+                )
+                _FLASH_ATTENTION_FALLBACK_WARNED = True
+            
+            q_sdpa = q.reshape(batch_size * self.num_heads, seq_len, self.head_dim)
+            k_sdpa = k.reshape(batch_size * self.num_heads, seq_len, self.head_dim)
+            v_sdpa = v.reshape(batch_size * self.num_heads, seq_len, self.head_dim)
+            
+            attn_output = F.scaled_dot_product_attention(
+                q_sdpa,
+                k_sdpa,
+                v_sdpa,
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=True
+            )
+            attn_output = attn_output.view(batch_size, self.num_heads, seq_len, self.head_dim)
+            attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.dim)
         
         # Output projection
         output = self.o_proj(attn_output)

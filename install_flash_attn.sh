@@ -14,6 +14,25 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
+# Detect GPU architecture (if CUDA is visible)
+GPU_ARCH=$(python - <<'PY'
+import torch
+if torch.cuda.is_available():
+    cc = torch.cuda.get_device_capability(0)
+    print(f"sm_{cc[0]}{cc[1]}")
+PY
+)
+
+if [ -n "$GPU_ARCH" ]; then
+    echo "Detected CUDA compute capability: $GPU_ARCH"
+fi
+
+if [ "$GPU_ARCH" = "sm_120" ]; then
+    echo "Detected NVIDIA Blackwell GPU. Forcing FlashAttention rebuild with sm_120 support."
+    export TORCH_CUDA_ARCH_LIST="sm90;sm120"
+    export FLASH_ATTENTION_FORCE_BUILD=1
+fi
+
 # Install build dependencies if not already installed
 echo "Installing build dependencies (psutil, ninja, packaging)..."
 pip install psutil>=5.9.0 ninja>=1.10.0 packaging>=21.0
