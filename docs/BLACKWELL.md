@@ -13,8 +13,11 @@ below to get a compatible stack before launching `torchrun`.
 pip uninstall -y torch torchvision torchaudio
 
 # Install the PyTorch nightly wheel with CUDA 12.4+
-pip install --pre torch torchvision torchaudio \
-    --index-url https://download.pytorch.org/whl/nightly/cu124
+# Check the following:
+#   https://download.pytorch.org/whl/cu128/torch/
+#   https://download.pytorch.org/whl/cu128/torchvision
+#   https://download.pytorch.org/whl/cu128/torchaudio
+pip3 install torch==2.9.1 torchvision==0.24.1 torchaudio==2.9.1 --index-url https://download.pytorch.org/whl/cu126
 ```
 
 > **Windows / PowerShell:** use the same command inside an elevated PowerShell
