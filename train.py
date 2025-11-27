@@ -391,7 +391,7 @@ def train(config: TrainingConfig):
         print(f"  Total optimizer steps: {total_steps:,}")
         print(f"  Warmup steps: {warmup_steps:,}")
     
-    # Create dataloader
+    # Create dataloader with distributed sharding
     dataloader = create_dataloader(
         data_path=config.data_path,
         tokenizer=tokenizer,
@@ -401,7 +401,9 @@ def train(config: TrainingConfig):
         pin_memory=True,
         limit=None,  # Use all available data
         streaming=True,
-        target_tokens=config.total_tokens  # Limit to target token count
+        target_tokens=config.total_tokens,  # Limit to target token count
+        rank=rank,
+        world_size=world_size
     )
     
     # Checkpoint manager

@@ -117,6 +117,8 @@ class StreamingFineWebDataset(IterableDataset):
     Example output:
         [Doc1_tokens, EOS, Doc2_tokens, EOS, Doc3_start...]
         [Doc3_continued, EOS, Doc4_tokens, EOS, Doc5...]
+    
+    Supports distributed training by sharding documents across ranks.
     """
     
     def __init__(
@@ -124,13 +126,17 @@ class StreamingFineWebDataset(IterableDataset):
         data_path: str,
         tokenizer,
         max_length: int = 8192,
-        limit: Optional[int] = None
+        limit: Optional[int] = None,
+        rank: int = 0,
+        world_size: int = 1
     ):
         super().__init__()
         self.data_path = data_path
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.limit = limit
+        self.rank = rank
+        self.world_size = world_size
         
         # Note: We don't mask by pad_token_id anymore to avoid EOS/PAD collision issues
         # Instead, we mask by position using num_real_tokens from the buffer
@@ -139,14 +145,22 @@ class StreamingFineWebDataset(IterableDataset):
         """
         Iterate over packed sequences.
         Each sequence is densely packed with document tokens.
+        Shards data across distributed ranks.
         """
         # Create fresh reader and buffer for each iteration
         # ParquetReader expects -1 for no limit, not None
         data_reader = ParquetReader(self.data_path, limit=self.limit if self.limit is not None else -1)
         buffer = PackedTokenBuffer(self.tokenizer, self.max_length)
         
-        # Process documents
+        # Process documents, sharding across ranks
+        doc_idx = 0
         for doc in data_reader():
+            # Shard documents across ranks: rank 0 gets docs 0, 2, 4...; rank 1 gets 1, 3, 5...
+            if doc_idx % self.world_size != self.rank:
+                doc_idx += 1
+                continue
+            doc_idx += 1
+            
             if not hasattr(doc, 'text') or not doc.text:
                 continue
             
@@ -270,6 +284,7 @@ class TokenLimitedDataset(IterableDataset):
     """
     Streaming dataset that stops after processing a target number of REAL tokens.
     Uses token packing for efficiency.
+    Supports distributed training by sharding documents across ranks.
     """
     
     def __init__(
@@ -278,7 +293,9 @@ class TokenLimitedDataset(IterableDataset):
         tokenizer,
         max_length: int = 8192,
         target_tokens: int = 7_700_000_000,
-        document_limit: Optional[int] = None
+        document_limit: Optional[int] = None,
+        rank: int = 0,
+        world_size: int = 1
     ):
         super().__init__()
         self.data_path = data_path
@@ -286,33 +303,46 @@ class TokenLimitedDataset(IterableDataset):
         self.max_length = max_length
         self.target_tokens = target_tokens
         self.document_limit = document_limit
+        self.rank = rank
+        self.world_size = world_size
         
-        # Estimate number of sequences we'll produce
+        # Estimate number of sequences we'll produce (per rank)
         # With packing, each sequence contains ~max_length real tokens
-        self._estimated_length = max(1, target_tokens // max_length)
+        self._estimated_length = max(1, target_tokens // max_length // world_size)
     
     def __len__(self):
-        """Estimated length based on target tokens."""
+        """Estimated length based on target tokens (per rank)."""
         return self._estimated_length
     
     def __iter__(self) -> Iterator[dict]:
-        """Iterate until target token count is reached."""
+        """Iterate until target token count is reached. Shards data across ranks."""
         # ParquetReader expects -1 for no limit, not None
         data_reader = ParquetReader(self.data_path, limit=self.document_limit if self.document_limit is not None else -1)
         buffer = PackedTokenBuffer(self.tokenizer, self.max_length)
         
         tokens_yielded = 0
         sequences_yielded = 0
+        # Each rank processes target_tokens / world_size tokens
+        tokens_per_rank = self.target_tokens // self.world_size
         
+        # Shard documents across ranks
+        doc_idx = 0
         for doc in data_reader():
+            # Shard documents: rank 0 gets docs 0, 2, 4...; rank 1 gets 1, 3, 5...
+            if doc_idx % self.world_size != self.rank:
+                doc_idx += 1
+                continue
+            doc_idx += 1
+            
             if not hasattr(doc, 'text') or not doc.text:
                 continue
             
             buffer.add_document(doc.text)
             
             while buffer.has_complete_sequence():
-                if tokens_yielded >= self.target_tokens:
-                    print(f"\nReached target: {tokens_yielded:,} tokens in {sequences_yielded:,} sequences")
+                if tokens_yielded >= tokens_per_rank:
+                    if self.rank == 0:
+                        print(f"\nRank {self.rank} reached target: {tokens_yielded:,} tokens in {sequences_yielded:,} sequences")
                     return
                 
                 token_ids, num_real = buffer.get_sequence()
@@ -322,14 +352,15 @@ class TokenLimitedDataset(IterableDataset):
                 sequences_yielded += 1
         
         # Yield remaining if we haven't hit target yet
-        if tokens_yielded < self.target_tokens:
+        if tokens_yielded < tokens_per_rank:
             remaining = buffer.get_remaining()
             if remaining is not None:
                 token_ids, num_real = remaining
                 yield self._create_training_sample(token_ids, num_real)
                 tokens_yielded += num_real
         
-        print(f"\nDataset exhausted: {tokens_yielded:,} tokens in {sequences_yielded:,} sequences")
+        if self.rank == 0:
+            print(f"\nRank {self.rank} dataset exhausted: {tokens_yielded:,} tokens in {sequences_yielded:,} sequences")
     
     def _create_training_sample(self, token_ids: List[int], num_real_tokens: int) -> dict:
         """Create input_ids and labels tensors."""
@@ -359,7 +390,9 @@ def create_dataloader(
     limit: Optional[int] = None,
     streaming: bool = True,
     target_tokens: Optional[int] = None,
-    estimate_sample_size: int = 1000
+    estimate_sample_size: int = 1000,
+    rank: int = 0,
+    world_size: int = 1
 ) -> DataLoader:
     """
     Create a DataLoader for FineWeb dataset with efficient token packing.
@@ -376,8 +409,10 @@ def create_dataloader(
         pin_memory: Whether to pin memory for faster GPU transfer
         limit: Limit number of documents (None for all)
         streaming: Whether to use streaming dataset (more memory efficient)
-        target_tokens: Target number of REAL tokens to process
+        target_tokens: Target number of REAL tokens to process (total across all ranks)
         estimate_sample_size: Number of documents to sample for estimation (unused with packing)
+        rank: Current process rank for distributed training
+        world_size: Total number of processes for distributed training
     
     Returns:
         DataLoader instance
@@ -390,13 +425,18 @@ def create_dataloader(
             tokenizer, 
             max_length, 
             target_tokens,
-            document_limit=limit
+            document_limit=limit,
+            rank=rank,
+            world_size=world_size
         )
-        print(f"Created TokenLimitedDataset targeting {target_tokens / 1e9:.2f}B tokens")
-        print(f"With max_length={max_length}, expecting ~{target_tokens // max_length:,} sequences")
+        if rank == 0:
+            print(f"Created TokenLimitedDataset targeting {target_tokens / 1e9:.2f}B tokens total")
+            print(f"With {world_size} ranks, each processes ~{target_tokens / world_size / 1e9:.2f}B tokens")
+            print(f"With max_length={max_length}, expecting ~{target_tokens // max_length // world_size:,} sequences per rank")
     elif streaming:
-        dataset = StreamingFineWebDataset(data_path, tokenizer, max_length, limit)
-        print(f"Created StreamingFineWebDataset with efficient token packing")
+        dataset = StreamingFineWebDataset(data_path, tokenizer, max_length, limit, rank=rank, world_size=world_size)
+        if rank == 0:
+            print(f"Created StreamingFineWebDataset with efficient token packing")
     else:
         # ParquetReader expects -1 for no limit, not None
         data_reader = ParquetReader(data_path, limit=limit if limit is not None else -1)
