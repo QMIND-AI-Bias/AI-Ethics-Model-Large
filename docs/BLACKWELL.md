@@ -14,10 +14,10 @@ pip uninstall -y torch torchvision torchaudio
 
 # Install the PyTorch nightly wheel with CUDA 12.4+
 # Check the following:
-#   https://download.pytorch.org/whl/cu128/torch/
-#   https://download.pytorch.org/whl/cu128/torchvision
-#   https://download.pytorch.org/whl/cu128/torchaudio
-pip3 install torch==2.9.1 torchvision==0.24.1 torchaudio==2.9.1 --index-url https://download.pytorch.org/whl/cu126
+#   https://download.pytorch.org/whl/cu130/torch/
+#   https://download.pytorch.org/whl/cu130/torchvision
+#   https://download.pytorch.org/whl/cu130/torchaudio
+pip3 install torch==2.9.1 torchvision==0.24.1 torchaudio==2.9.1 --index-url https://download.pytorch.org/whl/cu130
 ```
 
 > **Windows / PowerShell:** use the same command inside an elevated PowerShell
@@ -49,7 +49,7 @@ architecture flags.
 ```bash
 export TORCH_CUDA_ARCH_LIST="sm90;sm120"
 export FLASH_ATTENTION_FORCE_BUILD=1
-pip install --force-reinstall --no-build-isolation flash-attn
+pip3 install --force-reinstall --no-build-isolation flash-attn
 ```
 
 **Windows PowerShell:**
