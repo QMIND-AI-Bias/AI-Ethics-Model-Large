@@ -6,9 +6,11 @@ Includes checkpointing for disruption recovery.
 import os
 import json
 import time
+import signal
 import argparse
 from pathlib import Path
 from typing import Optional, Dict, Any
+from contextlib import contextmanager
 
 import torch
 import torch.nn as nn
@@ -23,6 +25,31 @@ from data_loader import create_dataloader
 from config import TrainingConfig
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+
+@contextmanager
+def defer_interrupts():
+    """
+    Context manager that defers SIGINT (Ctrl+C) until the block completes.
+    This ensures atomic operations like checkpoint saves complete fully.
+    """
+    # Use a mutable container to track if interrupt was received DURING this block
+    # This avoids issues with nested calls or re-entry after previous interrupts
+    interrupt_received = [False]
+    original_handler = signal.getsignal(signal.SIGINT)
+    
+    def deferred_handler(signum, frame):
+        interrupt_received[0] = True
+        print("\n[Interrupt received - will exit after current operation completes...]")
+    
+    signal.signal(signal.SIGINT, deferred_handler)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGINT, original_handler)
+        if interrupt_received[0]:
+            # Re-raise the interrupt now that we're done
+            raise KeyboardInterrupt()
 
 def setup_distributed():
     """Setup distributed training if available"""
@@ -56,10 +83,20 @@ def broadcast_from_main(obj, src: int = 0):
 
 
 class CheckpointManager:
-    """Manages saving and loading checkpoints"""
+    """Manages saving and loading checkpoints with atomic writes"""
     def __init__(self, checkpoint_dir: str):
         self.checkpoint_dir = Path(checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    
+    def _atomic_save(self, checkpoint: dict, path: Path):
+        """
+        Save checkpoint atomically by writing to a temp file first, then renaming.
+        This prevents corruption if interrupted mid-save.
+        """
+        temp_path = path.with_suffix('.pt.tmp')
+        torch.save(checkpoint, temp_path)
+        # os.replace is atomic on POSIX systems
+        os.replace(temp_path, path)
     
     def save_checkpoint(
         self,
@@ -72,40 +109,63 @@ class CheckpointManager:
         config: TrainingConfig,
         is_best: bool = False
     ):
-        """Save training checkpoint"""
-        checkpoint = {
-            'epoch': epoch,
-            'step': step,
-            'model_state_dict': model.module.state_dict() if isinstance(model, DDP) else model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
-            'loss': loss,
-            'config': config.__dict__
-        }
-        
-        # Save latest checkpoint
-        latest_path = self.checkpoint_dir / 'checkpoint_latest.pt'
-        torch.save(checkpoint, latest_path)
-        
-        # Save step checkpoint
-        step_path = self.checkpoint_dir / f'checkpoint_step_{step}.pt'
-        torch.save(checkpoint, step_path)
-        
-        # Save best checkpoint
-        if is_best:
-            best_path = self.checkpoint_dir / 'checkpoint_best.pt'
-            torch.save(checkpoint, best_path)
-        
-        # Save metadata
-        metadata = {
-            'latest_step': step,
-            'latest_epoch': epoch,
-            'latest_loss': loss,
-            'checkpoint_dir': str(self.checkpoint_dir)
-        }
-        metadata_path = self.checkpoint_dir / 'metadata.json'
-        with open(metadata_path, 'w') as f:
-            json.dump(metadata, f, indent=2)
+        """Save training checkpoint atomically with interrupt protection"""
+        # Defer interrupts during the entire save operation
+        with defer_interrupts():
+            checkpoint = {
+                'epoch': epoch,
+                'step': step,
+                'model_state_dict': model.module.state_dict() if isinstance(model, DDP) else model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+                'loss': loss,
+                'config': config.__dict__
+            }
+            
+            # Save latest checkpoint (atomic)
+            latest_path = self.checkpoint_dir / 'checkpoint_latest.pt'
+            self._atomic_save(checkpoint, latest_path)
+            
+            # Save step checkpoint (atomic)
+            step_path = self.checkpoint_dir / f'checkpoint_step_{step}.pt'
+            self._atomic_save(checkpoint, step_path)
+            
+            # Save best checkpoint (atomic)
+            if is_best:
+                best_path = self.checkpoint_dir / 'checkpoint_best.pt'
+                self._atomic_save(checkpoint, best_path)
+            
+            # Save metadata (also atomic)
+            metadata = {
+                'latest_step': step,
+                'latest_epoch': epoch,
+                'latest_loss': loss,
+                'checkpoint_dir': str(self.checkpoint_dir)
+            }
+            metadata_path = self.checkpoint_dir / 'metadata.json'
+            temp_metadata_path = metadata_path.with_suffix('.json.tmp')
+            with open(temp_metadata_path, 'w') as f:
+                json.dump(metadata, f, indent=2)
+            os.replace(temp_metadata_path, metadata_path)
+            
+            # Clean up any leftover temp files from previous interrupted saves
+            self._cleanup_temp_files()
+    
+    def _cleanup_temp_files(self):
+        """Remove any leftover .tmp files from interrupted saves"""
+        for tmp_file in self.checkpoint_dir.glob('*.tmp'):
+            try:
+                tmp_file.unlink()
+            except OSError:
+                pass
+    
+    def _try_load_checkpoint(self, checkpoint_path: Path) -> Optional[dict]:
+        """Try to load a checkpoint file, return None if corrupted"""
+        try:
+            return torch.load(checkpoint_path, map_location='cpu')
+        except (RuntimeError, EOFError, Exception) as e:
+            print(f"Warning: Failed to load {checkpoint_path}: {e}")
+            return None
     
     def load_checkpoint(
         self,
@@ -114,15 +174,51 @@ class CheckpointManager:
         scheduler: Any,
         checkpoint_path: Optional[str] = None
     ) -> Dict[str, Any]:
-        """Load training checkpoint"""
+        """Load training checkpoint with fallback to previous checkpoints if corrupted"""
+        self._cleanup_temp_files()  # Clean up any temp files first
+        
         if checkpoint_path is None:
             # Try to load latest
             latest_path = self.checkpoint_dir / 'checkpoint_latest.pt'
             if not latest_path.exists():
                 return None
             checkpoint_path = latest_path
+        else:
+            checkpoint_path = Path(checkpoint_path)
         
-        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        # Try loading the requested checkpoint
+        checkpoint = self._try_load_checkpoint(checkpoint_path)
+        
+        # If failed, try to find a valid checkpoint
+        if checkpoint is None:
+            print("Primary checkpoint corrupted. Searching for valid backup...")
+            
+            # Get all step checkpoints sorted by step number (descending)
+            step_checkpoints = sorted(
+                self.checkpoint_dir.glob('checkpoint_step_*.pt'),
+                key=lambda p: int(p.stem.split('_')[-1]),
+                reverse=True
+            )
+            
+            for backup_path in step_checkpoints:
+                if backup_path == checkpoint_path:
+                    continue  # Skip the one we already tried
+                print(f"Trying backup: {backup_path}")
+                checkpoint = self._try_load_checkpoint(backup_path)
+                if checkpoint is not None:
+                    print(f"Successfully loaded backup checkpoint from step {checkpoint['step']}")
+                    # Remove corrupted checkpoint
+                    try:
+                        Path(checkpoint_path).unlink()
+                        print(f"Removed corrupted checkpoint: {checkpoint_path}")
+                    except OSError:
+                        pass
+                    break
+            
+            if checkpoint is None:
+                raise RuntimeError(
+                    f"All checkpoints are corrupted. Please delete {self.checkpoint_dir} and restart training."
+                )
         
         # Load model state
         if isinstance(model, DDP):
@@ -435,30 +531,12 @@ def train(config: TrainingConfig):
     
     except KeyboardInterrupt:
         if is_main_process:
-            print("\nTraining interrupted. Saving checkpoint...")
-            # Finish current accumulation if needed
-            if accumulation_counter % config.gradient_accumulation_steps != 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad()
-                global_step += 1
-            
-            avg_loss = running_loss / loss_count if loss_count > 0 else 0.0
-            checkpoint_manager.save_checkpoint(
-                model=model,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                epoch=epoch,
-                step=global_step,
-                loss=avg_loss,
-                config=config,
-                is_best=False
-            )
+            print("\nTraining interrupted by user.")
     
     finally:
         if is_main_process:
             pbar.close()
+            
             # Finish any remaining accumulation
             if accumulation_counter % config.gradient_accumulation_steps != 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
@@ -467,8 +545,9 @@ def train(config: TrainingConfig):
                 optimizer.zero_grad()
                 global_step += 1
             
-            # Final checkpoint
+            # Save final checkpoint (atomic save with interrupt protection)
             avg_loss = running_loss / loss_count if loss_count > 0 else 0.0
+            print(f"\nSaving final checkpoint at step {global_step}...")
             checkpoint_manager.save_checkpoint(
                 model=model,
                 optimizer=optimizer,
@@ -479,7 +558,7 @@ def train(config: TrainingConfig):
                 config=config,
                 is_best=False
             )
-            print(f"\nTraining completed. Final checkpoint saved.")
+            print(f"Checkpoint saved successfully.")
         
         cleanup_distributed()
 

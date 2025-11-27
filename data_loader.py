@@ -526,7 +526,8 @@ def verify_packing_efficiency(
     
     total_doc_tokens = 0
     doc_count = 0
-    packed_sequences = 0
+    complete_sequences = 0
+    remaining_tokens = 0
     
     for doc in data_reader():
         if doc_count >= num_samples:
@@ -542,11 +543,11 @@ def verify_packing_efficiency(
             buffer.add_document(doc.text)
             while buffer.has_complete_sequence():
                 _ = buffer.get_sequence()  # Returns tuple, we just need to count
-                packed_sequences += 1
+                complete_sequences += 1
     
-    # Add any remaining partial sequence
-    if len(buffer) > 0:
-        packed_sequences += 1
+    # Track remaining partial sequence separately
+    remaining_tokens = len(buffer)
+    packed_sequences = complete_sequences + (1 if remaining_tokens > 0 else 0)
     
     # Calculate stats
     avg_tokens_per_doc = total_doc_tokens / doc_count if doc_count > 0 else 0
@@ -555,8 +556,9 @@ def verify_packing_efficiency(
     unpacked_total_tokens = doc_count * max_length
     unpacked_real_ratio = total_doc_tokens / unpacked_total_tokens if unpacked_total_tokens > 0 else 0
     
-    # With packing: sequences are densely packed
-    packed_total_tokens = packed_sequences * max_length
+    # With packing: complete sequences are full, partial sequence has actual remaining tokens
+    # This gives accurate efficiency calculation
+    packed_total_tokens = (complete_sequences * max_length) + remaining_tokens
     packed_real_ratio = total_doc_tokens / packed_total_tokens if packed_total_tokens > 0 else 0
     
     stats = {
