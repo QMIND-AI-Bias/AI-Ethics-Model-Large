@@ -1,0 +1,43 @@
+# Training configuration for 1B parameter model on FineWeb
+
+# Model parameters
+vocab_size: 50257  # GPT-2 tokenizer default
+max_seq_len: 4096  # Reduced to fit A5000 memory while keeping long contexts
+
+# Training parameters
+batch_size: 4  # Per GPU batch size (safe for 24 GB GPUs at seq_len=4096 with checkpointing)
+learning_rate: 3.0e-4  # Standard learning rate for 1B models (keep at 3e-4 with gradient accumulation)
+weight_decay: 0.1
+max_grad_norm: 1.0
+warmup_ratio: 0.01  # 1% of training steps for warmup
+gradient_accumulation_steps: 32  # ~1.05M tokens/step with seq_len=4096 and batch_size=4
+# With 2 GPUs, batch_size=4, seq_len=4096, accumulation=32:
+#   - Tokens per micro-batch: 4 * 4096 * 2 = 32,768
+#   - Effective tokens per step: 32,768 * 32 = 1,048,576 ≈ 1M tokens/step
+activation_checkpointing: true  # Set true to enable activation checkpointing (reduces memory, slight speed loss)
+
+# Data parameters
+# For 7.7B tokens, you may need to use a specific sample or limit
+# Options:
+# - "hf://datasets/HuggingFaceFW/fineweb/sample/100BT" (100 billion tokens sample)
+# - "hf://datasets/HuggingFaceFW/fineweb/sample/10BT" (10 billion tokens sample)
+# - Use limit parameter in data_loader to restrict to 7.7B tokens
+data_path: "hf://datasets/HuggingFaceFW/fineweb/sample/100BT"
+total_tokens: 7700000000  # 7.7 billion tokens
+num_workers: 4  # Number of data loading workers
+
+# Tokenizer
+tokenizer_name: "gpt2"
+
+# Mixed precision training (required for FlashAttention)
+# Options: "fp16", "bf16", or "fp32" (fp32 will not work with FlashAttention)
+dtype: "bf16"  # bf16 is preferred for training stability
+
+# Checkpointing
+checkpoint_dir: "./checkpoints"
+checkpoint_interval: 1000  # Save checkpoint every N steps
+log_interval: 10  # Log every N steps
+
+# Resume training (set via command line)
+resume: false
+

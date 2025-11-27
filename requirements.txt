@@ -1,0 +1,19 @@
+# Core dependencies
+torch>=2.0.0
+transformers>=4.30.0
+datatrove>=0.6.0
+pyyaml>=6.0
+tqdm>=4.65.0
+numpy>=1.24.0
+
+# Build dependencies for FlashAttention-2
+# These are needed during flash-attn compilation
+psutil>=5.9.0
+ninja>=1.10.0
+packaging>=21.0
+
+# FlashAttention-2 must be installed separately AFTER torch
+# (flash-attn needs torch during build, so install order matters)
+# Install with: pip install flash-attn --no-build-isolation
+# Or use: bash install_flash_attn.sh
+
