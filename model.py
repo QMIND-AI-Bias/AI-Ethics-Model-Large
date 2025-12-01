@@ -61,9 +61,15 @@ class RoPE(nn.Module):
         device = x.device
         dtype = x.dtype
         
+        # Move inv_freq to correct device only if needed (buffer follows model.to() automatically,
+        # but we check in case forward is called before model is moved)
+        inv_freq = self.inv_freq
+        if inv_freq.device != device:
+            inv_freq = inv_freq.to(device)
+        
         # Create frequency matrix: [seq_len, head_dim // 2]
         t = torch.arange(seq_len, device=device, dtype=torch.float32)
-        freqs = torch.outer(t, self.inv_freq.to(device))  # [seq_len, head_dim // 2]
+        freqs = torch.outer(t, inv_freq)  # [seq_len, head_dim // 2]
         
         # Create cos and sin: [seq_len, head_dim // 2]
         cos = freqs.cos().to(dtype)  # [seq_len, head_dim // 2]
@@ -86,12 +92,14 @@ class RoPE(nn.Module):
 
 
 class SwiGLU(nn.Module):
-    """SwiGLU activation function: Swish(xW + b) ⊙ (xV + c)"""
-    def __init__(self, dim: int):
+    """SwiGLU activation function: Swish(xW) ⊙ (xV) then project down"""
+    def __init__(self, dim: int, ffn_dim: int):
         super().__init__()
-        self.linear_gate = nn.Linear(dim, dim, bias=False)
-        self.linear_up = nn.Linear(dim, dim, bias=False)
-        self.linear_down = nn.Linear(dim, dim, bias=False)
+        # Gate and up projections expand to ffn_dim
+        self.linear_gate = nn.Linear(dim, ffn_dim, bias=False)
+        self.linear_up = nn.Linear(dim, ffn_dim, bias=False)
+        # Down projection goes back to dim
+        self.linear_down = nn.Linear(ffn_dim, dim, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate = self.linear_gate(x)
@@ -134,10 +142,7 @@ class MultiHeadAttention(nn.Module):
         q = self.rope(q, seq_len)
         k = self.rope(k, seq_len)
         
-        # Reshape for FlashAttention: [batch, seq_len, num_heads, head_dim] -> [batch, num_heads, seq_len, head_dim]
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
+        # q, k, v are now [batch, seq_len, num_heads, head_dim]
         
         use_flash = (
             _FLASH_ATTN_AVAILABLE
@@ -146,16 +151,15 @@ class MultiHeadAttention(nn.Module):
         )
         
         if use_flash:
-            # FlashAttention expects causal mask by default, but we can pass custom mask
+            # FlashAttention expects [batch, seq_len, num_heads, head_dim] - no transpose needed!
             attn_output = flash_attn_func(
                 q, k, v,
                 dropout_p=self.dropout if self.training else 0.0,
                 softmax_scale=1.0 / math.sqrt(self.head_dim),
                 causal=True
-            )  # [batch, num_heads, seq_len, head_dim]
+            )  # Output: [batch, seq_len, num_heads, head_dim]
             
-            # Reshape back: [batch, num_heads, seq_len, head_dim] -> [batch, seq_len, num_heads, head_dim]
-            attn_output = attn_output.transpose(1, 2)
+            # Reshape to [batch, seq_len, dim]
             attn_output = attn_output.contiguous().view(batch_size, seq_len, self.dim)
         else:
             global _FLASH_ATTENTION_FALLBACK_WARNED
@@ -173,9 +177,10 @@ class MultiHeadAttention(nn.Module):
                 )
                 _FLASH_ATTENTION_FALLBACK_WARNED = True
             
-            q_sdpa = q.reshape(batch_size * self.num_heads, seq_len, self.head_dim)
-            k_sdpa = k.reshape(batch_size * self.num_heads, seq_len, self.head_dim)
-            v_sdpa = v.reshape(batch_size * self.num_heads, seq_len, self.head_dim)
+            # SDPA expects [batch, num_heads, seq_len, head_dim] - need to transpose
+            q_sdpa = q.transpose(1, 2)  # [batch, num_heads, seq_len, head_dim]
+            k_sdpa = k.transpose(1, 2)
+            v_sdpa = v.transpose(1, 2)
             
             attn_output = F.scaled_dot_product_attention(
                 q_sdpa,
@@ -183,8 +188,9 @@ class MultiHeadAttention(nn.Module):
                 v_sdpa,
                 dropout_p=self.dropout if self.training else 0.0,
                 is_causal=True
-            )
-            attn_output = attn_output.view(batch_size, self.num_heads, seq_len, self.head_dim)
+            )  # Output: [batch, num_heads, seq_len, head_dim]
+            
+            # Transpose back and reshape
             attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.dim)
         
         # Output projection
@@ -200,7 +206,7 @@ class TransformerBlock(nn.Module):
         self.attn = MultiHeadAttention(dim, num_heads, max_seq_len, dropout)
         
         self.ffn_norm = RMSNorm(dim)
-        self.ffn = SwiGLU(dim)
+        self.ffn = SwiGLU(dim, ffn_dim)
         
         self.dropout = nn.Dropout(dropout)
         
@@ -289,7 +295,8 @@ class DecoderOnlyTransformer(nn.Module):
         # Apply transformer blocks
         for layer in self.layers:
             if self.use_checkpoint and self.training:
-                x = activation_checkpoint(layer, x, use_reentrant=False)
+                # Pass mask as a keyword argument to activation_checkpoint
+                x = activation_checkpoint(layer, x, mask, use_reentrant=False)
             else:
                 x = layer(x, mask)
         

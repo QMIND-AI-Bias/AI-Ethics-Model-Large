@@ -89,7 +89,7 @@ def test_training():
             tokenizer=tokenizer,
             batch_size=config.batch_size,
             max_length=config.max_seq_len,
-            num_workers=2,  # Fewer workers for testing
+            num_workers=0,  # Must be 0 for IterableDataset to avoid duplicate data
             pin_memory=True,
             limit=100,  # Limit to 100 documents for testing
             streaming=True

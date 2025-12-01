@@ -22,12 +22,12 @@ class TrainingConfig:
     max_grad_norm: float = 1.0
     warmup_ratio: float = 0.01  # 1% of training steps for warmup
     gradient_accumulation_steps: int = 32  # Keeps effective tokens/step ≈1.05M with seq_len=4096 and batch_size=4
-    activation_checkpointing: bool = False  # Enable activation checkpointing to save memory
+    activation_checkpointing: bool = True  # Enable activation checkpointing to save memory
     
     # Data parameters
     data_path: str = "hf://datasets/HuggingFaceFW/fineweb/sample/100BT"  # 100BT sample
     total_tokens: int = 7_700_000_000  # 7.7 billion tokens
-    num_workers: int = 4
+    num_workers: int = 0  # Must be 0 for IterableDataset (streaming) to avoid duplicate data
     
     # Tokenizer
     tokenizer_name: str = "gpt2"

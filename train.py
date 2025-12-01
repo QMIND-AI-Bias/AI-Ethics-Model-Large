@@ -107,7 +107,8 @@ class CheckpointManager:
         step: int,
         loss: float,
         config: TrainingConfig,
-        is_best: bool = False
+        is_best: bool = False,
+        scaler: Any = None
     ):
         """Save training checkpoint atomically with interrupt protection"""
         # Defer interrupts during the entire save operation
@@ -118,6 +119,7 @@ class CheckpointManager:
                 'model_state_dict': model.module.state_dict() if isinstance(model, DDP) else model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+                'scaler_state_dict': scaler.state_dict() if scaler else None,
                 'loss': loss,
                 'config': config.__dict__
             }
@@ -172,7 +174,8 @@ class CheckpointManager:
         model: nn.Module,
         optimizer: torch.optim.Optimizer,
         scheduler: Any,
-        checkpoint_path: Optional[str] = None
+        checkpoint_path: Optional[str] = None,
+        scaler: Any = None
     ) -> Dict[str, Any]:
         """Load training checkpoint with fallback to previous checkpoints if corrupted"""
         self._cleanup_temp_files()  # Clean up any temp files first
@@ -232,6 +235,10 @@ class CheckpointManager:
         # Load scheduler state
         if scheduler and checkpoint.get('scheduler_state_dict'):
             scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        
+        # Load scaler state (for fp16 training)
+        if scaler and checkpoint.get('scaler_state_dict'):
+            scaler.load_state_dict(checkpoint['scaler_state_dict'])
         
         return checkpoint
     
@@ -332,15 +339,18 @@ def train(config: TrainingConfig):
         print(f"\nModel created with {num_params / 1e9:.2f}B parameters")
     
     # Setup dtype for mixed precision (required for FlashAttention)
+    # GradScaler is needed for fp16 to prevent gradient underflow; bf16 doesn't need it
+    scaler = None
     if config.dtype == "bf16":
         dtype = torch.bfloat16
         autocast_dtype = torch.bfloat16
     elif config.dtype == "fp16":
         dtype = torch.float16
         autocast_dtype = torch.float16
+        scaler = torch.amp.GradScaler('cuda')  # Prevents gradient underflow in fp16
     else:
         dtype = torch.float32
-        autocast_dtype = torch.float32
+        autocast_dtype = None  # No autocast for fp32 - avoids unnecessary overhead
     
     model = model.to(device)
     
@@ -421,7 +431,7 @@ def train(config: TrainingConfig):
         if checkpoint_info:
             if is_main_process:
                 print(f"\nResuming from checkpoint at step {checkpoint_info['latest_step']}")
-            checkpoint = checkpoint_manager.load_checkpoint(model, optimizer, scheduler)
+            checkpoint = checkpoint_manager.load_checkpoint(model, optimizer, scheduler, scaler=scaler)
             if checkpoint:
                 start_epoch = checkpoint['epoch']
                 start_step = checkpoint['step']
@@ -474,7 +484,10 @@ def train(config: TrainingConfig):
                 loss_value = loss.item() * config.gradient_accumulation_steps  # Unscale for logging
                 
                 # Backward pass (accumulates gradients)
-                loss.backward()
+                if scaler is not None:
+                    scaler.scale(loss).backward()
+                else:
+                    loss.backward()
                 
                 accumulation_counter += 1
                 running_loss += loss_value
@@ -482,11 +495,17 @@ def train(config: TrainingConfig):
                 
                 # Update weights only after accumulating enough gradients
                 if accumulation_counter % config.gradient_accumulation_steps == 0:
-                    # Gradient clipping (on accumulated gradients)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
+                    if scaler is not None:
+                        # Unscale gradients before clipping when using GradScaler
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        # Gradient clipping (on accumulated gradients)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
+                        optimizer.step()
                     
-                    # Optimizer step
-                    optimizer.step()
                     scheduler.step()
                     optimizer.zero_grad()
                     
@@ -527,7 +546,8 @@ def train(config: TrainingConfig):
                                 step=global_step,
                                 loss=avg_loss,
                                 config=config,
-                                is_best=is_best
+                                is_best=is_best,
+                                scaler=scaler
                             )
                             print(f"\nCheckpoint saved at step {global_step}, loss: {avg_loss:.4f}")
             
@@ -544,8 +564,14 @@ def train(config: TrainingConfig):
                 
                 # Finish any remaining accumulation
                 if accumulation_counter % config.gradient_accumulation_steps != 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
-                    optimizer.step()
+                    if scaler is not None:
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
+                        optimizer.step()
                     scheduler.step()
                     optimizer.zero_grad()
                     global_step += 1
@@ -561,7 +587,8 @@ def train(config: TrainingConfig):
                     step=global_step,
                     loss=avg_loss,
                     config=config,
-                    is_best=False
+                    is_best=False,
+                    scaler=scaler
                 )
                 print(f"Checkpoint saved successfully.")
         except KeyboardInterrupt:
