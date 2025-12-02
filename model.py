@@ -4,6 +4,7 @@ Decoder-only Transformer model with modern architecture components:
 - RMSNorm
 - SwiGLU activation
 - RoPE positional embeddings
+- Grouped Query Attention (GQA)
 - No biases in linear layers
 """
 
@@ -40,8 +41,8 @@ class RMSNorm(nn.Module):
 
 
 class RoPE(nn.Module):
-    """Rotary Positional Embeddings"""
-    def __init__(self, dim: int, max_seq_len: int = 8192, base: int = 10000):
+    """Rotary Positional Embeddings with configurable theta"""
+    def __init__(self, dim: int, max_seq_len: int = 8192, base: float = 10000.0):
         super().__init__()
         self.dim = dim
         self.max_seq_len = max_seq_len
@@ -109,41 +110,86 @@ class SwiGLU(nn.Module):
 
 
 class MultiHeadAttention(nn.Module):
-    """Multi-head attention with FlashAttention-2 and RoPE"""
-    def __init__(self, dim: int, num_heads: int, max_seq_len: int = 8192, dropout: float = 0.0):
+    """
+    Multi-head attention with FlashAttention-2, RoPE, and GQA support.
+    
+    Supports Grouped Query Attention (GQA) where num_kv_heads < num_heads.
+    When num_kv_heads == num_heads, this is standard MHA.
+    When num_kv_heads == 1, this is Multi-Query Attention (MQA).
+    """
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        num_kv_heads: Optional[int] = None,
+        max_seq_len: int = 8192,
+        rope_theta: float = 10000.0,
+        dropout: float = 0.0
+    ):
         super().__init__()
-        assert dim % num_heads == 0
         self.dim = dim
         self.num_heads = num_heads
+        # Default to standard MHA if num_kv_heads not specified
+        self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
         self.head_dim = dim // num_heads
         self.dropout = dropout
         
-        self.q_proj = nn.Linear(dim, dim, bias=False)
-        self.k_proj = nn.Linear(dim, dim, bias=False)
-        self.v_proj = nn.Linear(dim, dim, bias=False)
+        # Validate GQA configuration
+        assert dim % num_heads == 0, f"dim ({dim}) must be divisible by num_heads ({num_heads})"
+        assert num_heads % self.num_kv_heads == 0, \
+            f"num_heads ({num_heads}) must be divisible by num_kv_heads ({self.num_kv_heads})"
+        
+        # Number of query heads per KV head (for GQA expansion)
+        self.num_queries_per_kv = num_heads // self.num_kv_heads
+        
+        # Q projection: full size (num_heads * head_dim = dim)
+        self.q_proj = nn.Linear(dim, num_heads * self.head_dim, bias=False)
+        # K, V projections: reduced size for GQA (num_kv_heads * head_dim)
+        self.k_proj = nn.Linear(dim, self.num_kv_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(dim, self.num_kv_heads * self.head_dim, bias=False)
+        # Output projection
         self.o_proj = nn.Linear(dim, dim, bias=False)
         
-        self.rope = RoPE(self.head_dim, max_seq_len)
+        self.rope = RoPE(self.head_dim, max_seq_len, base=rope_theta)
+        
+    def _expand_kv_to_match_q(self, kv: torch.Tensor) -> torch.Tensor:
+        """
+        Expand K or V from [batch, seq, num_kv_heads, head_dim] 
+        to [batch, seq, num_heads, head_dim] by repeating.
+        
+        For GQA with num_heads=32, num_kv_heads=8:
+        Each KV head is shared by 4 query heads.
+        """
+        if self.num_kv_heads == self.num_heads:
+            return kv  # No expansion needed for standard MHA
+        
+        batch, seq_len, num_kv_heads, head_dim = kv.shape
+        
+        # Expand: [batch, seq, num_kv_heads, 1, head_dim] -> [batch, seq, num_kv_heads, n_rep, head_dim]
+        kv = kv.unsqueeze(3).expand(batch, seq_len, num_kv_heads, self.num_queries_per_kv, head_dim)
+        # Reshape: [batch, seq, num_heads, head_dim]
+        kv = kv.reshape(batch, seq_len, self.num_heads, head_dim)
+        
+        return kv
         
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         batch_size, seq_len, _ = x.shape
         
         # Project to Q, K, V
-        q = self.q_proj(x)  # [batch, seq_len, dim]
-        k = self.k_proj(x)
-        v = self.v_proj(x)
+        q = self.q_proj(x)  # [batch, seq_len, num_heads * head_dim]
+        k = self.k_proj(x)  # [batch, seq_len, num_kv_heads * head_dim]
+        v = self.v_proj(x)  # [batch, seq_len, num_kv_heads * head_dim]
         
         # Reshape for multi-head attention
         q = q.view(batch_size, seq_len, self.num_heads, self.head_dim)
-        k = k.view(batch_size, seq_len, self.num_heads, self.head_dim)
-        v = v.view(batch_size, seq_len, self.num_heads, self.head_dim)
+        k = k.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
+        v = v.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
         
-        # Apply RoPE
+        # Apply RoPE to Q and K
         q = self.rope(q, seq_len)
         k = self.rope(k, seq_len)
         
-        # q, k, v are now [batch, seq_len, num_heads, head_dim]
-        
+        # Check if we can use FlashAttention
         use_flash = (
             _FLASH_ATTN_AVAILABLE
             and x.is_cuda
@@ -151,9 +197,14 @@ class MultiHeadAttention(nn.Module):
         )
         
         if use_flash:
-            # FlashAttention expects [batch, seq_len, num_heads, head_dim] - no transpose needed!
+            # FlashAttention-2 supports GQA natively when k,v have fewer heads
+            # It expects [batch, seq_len, num_heads, head_dim]
+            # For GQA, we need to expand k,v to match q's head count
+            k_expanded = self._expand_kv_to_match_q(k)
+            v_expanded = self._expand_kv_to_match_q(v)
+            
             attn_output = flash_attn_func(
-                q, k, v,
+                q, k_expanded, v_expanded,
                 dropout_p=self.dropout if self.training else 0.0,
                 softmax_scale=1.0 / math.sqrt(self.head_dim),
                 causal=True
@@ -177,10 +228,14 @@ class MultiHeadAttention(nn.Module):
                 )
                 _FLASH_ATTENTION_FALLBACK_WARNED = True
             
+            # Expand K, V for GQA before SDPA
+            k_expanded = self._expand_kv_to_match_q(k)
+            v_expanded = self._expand_kv_to_match_q(v)
+            
             # SDPA expects [batch, num_heads, seq_len, head_dim] - need to transpose
             q_sdpa = q.transpose(1, 2)  # [batch, num_heads, seq_len, head_dim]
-            k_sdpa = k.transpose(1, 2)
-            v_sdpa = v.transpose(1, 2)
+            k_sdpa = k_expanded.transpose(1, 2)
+            v_sdpa = v_expanded.transpose(1, 2)
             
             attn_output = F.scaled_dot_product_attention(
                 q_sdpa,
@@ -199,13 +254,25 @@ class MultiHeadAttention(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    """Transformer decoder block with RMSNorm, SwiGLU, and FlashAttention"""
-    def __init__(self, dim: int, num_heads: int, ffn_dim: int, max_seq_len: int = 8192, dropout: float = 0.0):
+    """Transformer decoder block with RMSNorm, SwiGLU, FlashAttention, and GQA"""
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        ffn_dim: int,
+        num_kv_heads: Optional[int] = None,
+        max_seq_len: int = 8192,
+        rope_theta: float = 10000.0,
+        rms_norm_eps: float = 1e-6,
+        dropout: float = 0.0
+    ):
         super().__init__()
-        self.attn_norm = RMSNorm(dim)
-        self.attn = MultiHeadAttention(dim, num_heads, max_seq_len, dropout)
+        self.attn_norm = RMSNorm(dim, eps=rms_norm_eps)
+        self.attn = MultiHeadAttention(
+            dim, num_heads, num_kv_heads, max_seq_len, rope_theta, dropout
+        )
         
-        self.ffn_norm = RMSNorm(dim)
+        self.ffn_norm = RMSNorm(dim, eps=rms_norm_eps)
         self.ffn = SwiGLU(dim, ffn_dim)
         
         self.dropout = nn.Dropout(dropout)
@@ -230,15 +297,18 @@ class TransformerBlock(nn.Module):
 
 
 class DecoderOnlyTransformer(nn.Module):
-    """Decoder-only Transformer model"""
+    """Decoder-only Transformer model with GQA support"""
     def __init__(
         self,
         vocab_size: int,
         dim: int = 2048,
         num_layers: int = 24,
         num_heads: int = 16,
+        num_kv_heads: Optional[int] = None,
         ffn_dim: int = 8192,
         max_seq_len: int = 8192,
+        rope_theta: float = 10000.0,
+        rms_norm_eps: float = 1e-6,
         dropout: float = 0.0,
         tie_weights: bool = True,
         use_checkpoint: bool = False
@@ -255,12 +325,15 @@ class DecoderOnlyTransformer(nn.Module):
         
         # Transformer blocks
         self.layers = nn.ModuleList([
-            TransformerBlock(dim, num_heads, ffn_dim, max_seq_len, dropout)
+            TransformerBlock(
+                dim, num_heads, ffn_dim, num_kv_heads,
+                max_seq_len, rope_theta, rms_norm_eps, dropout
+            )
             for _ in range(num_layers)
         ])
         
         # Final layer norm
-        self.norm = RMSNorm(dim)
+        self.norm = RMSNorm(dim, eps=rms_norm_eps)
         
         # Output head
         self.head = nn.Linear(dim, vocab_size, bias=False)
@@ -313,6 +386,34 @@ class DecoderOnlyTransformer(nn.Module):
         return sum(p.numel() for p in self.parameters())
 
 
+def create_model_from_config(config) -> DecoderOnlyTransformer:
+    """
+    Create a model from a TrainingConfig object.
+    This is the primary factory function for creating models.
+    
+    Args:
+        config: TrainingConfig object with model architecture parameters
+    
+    Returns:
+        DecoderOnlyTransformer instance
+    """
+    model = DecoderOnlyTransformer(
+        vocab_size=config.vocab_size,
+        dim=config.hidden_size,
+        num_layers=config.num_hidden_layers,
+        num_heads=config.num_attention_heads,
+        num_kv_heads=config.num_key_value_heads,
+        ffn_dim=config.intermediate_size,
+        max_seq_len=config.max_seq_len,
+        rope_theta=config.rope_theta,
+        rms_norm_eps=config.rms_norm_eps,
+        dropout=0.0,  # No dropout for large models during pretraining
+        tie_weights=config.tie_word_embeddings,
+        use_checkpoint=config.activation_checkpointing
+    )
+    return model
+
+
 def create_1b_model(
     vocab_size: int = 50257,
     max_seq_len: int = 8192,
@@ -335,11 +436,49 @@ def create_1b_model(
         dim=2048,
         num_layers=24,
         num_heads=16,
+        num_kv_heads=None,  # Standard MHA
         ffn_dim=8192,
         max_seq_len=max_seq_len,
+        rope_theta=10000.0,
+        rms_norm_eps=1e-6,
         dropout=0.1,
         tie_weights=True,
         use_checkpoint=use_checkpoint
     )
     return model
 
+
+def create_7b_model(
+    vocab_size: int = 128256,
+    max_seq_len: int = 8192,
+    use_checkpoint: bool = False
+) -> DecoderOnlyTransformer:
+    """
+    Create a ~7 billion parameter model (Llama-2/Mistral style)
+    
+    Configuration:
+    - dim: 4096
+    - num_layers: 32
+    - num_heads: 32 (query heads)
+    - num_kv_heads: 8 (GQA - grouped query attention)
+    - ffn_dim: 11008 (SwiGLU ratio ~2.7x)
+    - vocab_size: 128256 (Llama-3 tokenizer)
+    - rope_theta: 500000.0 (for long context)
+    
+    This should give approximately 7B parameters.
+    """
+    model = DecoderOnlyTransformer(
+        vocab_size=vocab_size,
+        dim=4096,
+        num_layers=32,
+        num_heads=32,
+        num_kv_heads=8,  # GQA: 4 query heads per KV head
+        ffn_dim=11008,
+        max_seq_len=max_seq_len,
+        rope_theta=500000.0,
+        rms_norm_eps=1e-5,
+        dropout=0.0,  # No dropout for large model pretraining
+        tie_weights=False,
+        use_checkpoint=use_checkpoint
+    )
+    return model

@@ -1,31 +1,72 @@
 """
-Training script for 1B parameter decoder-only transformer on FineWeb dataset.
-Includes checkpointing for disruption recovery.
+Training script for decoder-only transformer on FineWeb dataset.
+Supports 1B and 7B models with full architecture configuration.
+Includes checkpointing for disruption recovery and cosine LR schedule with min_lr.
 """
 
 import os
 import json
 import time
+import math
 import signal
 import argparse
 from pathlib import Path
 from typing import Optional, Dict, Any
-from contextlib import contextmanager
 
 import torch
 import torch.nn as nn
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
-from transformers import AutoTokenizer, get_linear_schedule_with_warmup
+from torch.optim.lr_scheduler import LambdaLR
+from transformers import AutoTokenizer
 from tqdm import tqdm
 
-from model import create_1b_model
+from model import create_model_from_config, create_1b_model, create_7b_model
 from data_loader import create_dataloader
 from config import TrainingConfig
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
+
+def get_cosine_schedule_with_warmup_and_min_lr(
+    optimizer,
+    num_warmup_steps: int,
+    num_training_steps: int,
+    min_lr_ratio: float = 0.1
+) -> LambdaLR:
+    """
+    Create a schedule with linear warmup followed by cosine decay to min_lr.
+    
+    Unlike the standard cosine schedule which decays to 0, this decays to
+    min_lr_ratio * initial_lr (typically 10% of peak LR).
+    
+    Args:
+        optimizer: The optimizer to schedule
+        num_warmup_steps: Number of warmup steps
+        num_training_steps: Total number of training steps
+        min_lr_ratio: Minimum LR as ratio of initial LR (default 0.1 = 10%)
+    
+    Returns:
+        LambdaLR scheduler
+    """
+    def lr_lambda(current_step: int) -> float:
+        # Warmup phase: linear increase from 0 to 1
+        if current_step < num_warmup_steps:
+            return float(current_step) / float(max(1, num_warmup_steps))
+        
+        # Cosine decay phase: from 1 to min_lr_ratio
+        progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
+        # Cosine annealing: starts at 1, ends at min_lr_ratio
+        cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+        # Scale: when progress=0, cosine_decay=1.0 -> returns 1.0
+        #        when progress=1, cosine_decay=0.0 -> returns min_lr_ratio
+        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine_decay
+    
+    return LambdaLR(optimizer, lr_lambda)
+
+
+from contextlib import contextmanager
 
 @contextmanager
 def defer_interrupts():
@@ -314,7 +355,7 @@ def train(config: TrainingConfig):
     
     if is_main_process:
         print(f"Training configuration:")
-        print(json.dumps(config.__dict__, indent=2))
+        print(json.dumps(config.__dict__, indent=2, default=str))
         print(f"\nUsing device: {device}")
         print(f"World size: {world_size}")
     
@@ -325,18 +366,29 @@ def train(config: TrainingConfig):
     # Set tokenizer max length to match our config to suppress warnings
     tokenizer.model_max_length = config.max_seq_len
     
-    vocab_size = len(tokenizer)
+    # Use config vocab_size, but update if tokenizer differs
+    vocab_size = config.vocab_size
+    tokenizer_vocab_size = len(tokenizer)
+    if tokenizer_vocab_size != vocab_size:
+        if is_main_process:
+            print(f"Warning: Config vocab_size ({vocab_size}) differs from tokenizer ({tokenizer_vocab_size})")
+            print(f"Using tokenizer vocab_size: {tokenizer_vocab_size}")
+        vocab_size = tokenizer_vocab_size
+        config.vocab_size = vocab_size
     
-    # Create model
-    model = create_1b_model(
-        vocab_size=vocab_size,
-        max_seq_len=config.max_seq_len,
-        use_checkpoint=config.activation_checkpointing
-    )
+    # Create model from config
+    model = create_model_from_config(config)
     
     if is_main_process:
         num_params = model.get_num_params()
         print(f"\nModel created with {num_params / 1e9:.2f}B parameters")
+        print(f"  Hidden size: {config.hidden_size}")
+        print(f"  Layers: {config.num_hidden_layers}")
+        print(f"  Attention heads: {config.num_attention_heads}")
+        print(f"  KV heads: {config.num_key_value_heads or config.num_attention_heads}")
+        print(f"  FFN dim: {config.intermediate_size}")
+        print(f"  Max seq len: {config.max_seq_len}")
+        print(f"  RoPE theta: {config.rope_theta}")
     
     # Setup dtype for mixed precision (required for FlashAttention)
     # GradScaler is needed for fp16 to prevent gradient underflow; bf16 doesn't need it
@@ -384,12 +436,19 @@ def train(config: TrainingConfig):
     tokens_per_step = tokens_per_micro_batch * config.gradient_accumulation_steps
     # Total optimizer steps (not micro-batches)
     total_steps = int(config.total_tokens / tokens_per_step)
-    warmup_steps = int(total_steps * config.warmup_ratio)
     
-    scheduler = get_linear_schedule_with_warmup(
+    # Get warmup steps (uses warmup_steps if set, else calculates from warmup_ratio)
+    warmup_steps = config.get_warmup_steps(total_steps)
+    
+    # Calculate min_lr ratio for scheduler
+    min_lr_ratio = config.min_lr / config.learning_rate
+    
+    # Use cosine schedule with warmup and min_lr
+    scheduler = get_cosine_schedule_with_warmup_and_min_lr(
         optimizer,
         num_warmup_steps=warmup_steps,
-        num_training_steps=total_steps
+        num_training_steps=total_steps,
+        min_lr_ratio=min_lr_ratio
     )
     
     if is_main_process:
@@ -400,6 +459,9 @@ def train(config: TrainingConfig):
         print(f"  Effective tokens per step: {tokens_per_step:,}")
         print(f"  Total optimizer steps: {total_steps:,}")
         print(f"  Warmup steps: {warmup_steps:,}")
+        print(f"  Peak LR: {config.learning_rate:.2e}")
+        print(f"  Min LR: {config.min_lr:.2e}")
+        print(f"  LR schedule: Cosine with warmup")
     
     # Create dataloader with distributed sharding
     dataloader = create_dataloader(
@@ -601,13 +663,25 @@ def train(config: TrainingConfig):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Train 1B parameter model on FineWeb')
+    parser = argparse.ArgumentParser(description='Train transformer model on FineWeb')
     parser.add_argument('--config', type=str, default='config.yaml', help='Path to config file')
     parser.add_argument('--resume', action='store_true', help='Resume from latest checkpoint')
+    parser.add_argument('--model-size', type=str, choices=['1b', '7b'], default=None,
+                        help='Use preset config for model size (overrides --config)')
     args = parser.parse_args()
     
     # Load config
-    config = TrainingConfig.from_yaml(args.config) if os.path.exists(args.config) else TrainingConfig()
+    if args.model_size == '1b':
+        config = TrainingConfig.for_1b_model()
+        print("Using preset 1B model configuration")
+    elif args.model_size == '7b':
+        config = TrainingConfig.for_7b_model()
+        print("Using preset 7B model configuration")
+    elif os.path.exists(args.config):
+        config = TrainingConfig.from_yaml(args.config)
+    else:
+        config = TrainingConfig()
+    
     config.resume = args.resume
     
     # Run training
@@ -616,4 +690,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
